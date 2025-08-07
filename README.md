@@ -18,7 +18,7 @@
 ## Установка
 1. Клонируйте репозиторий:
    ```
-   git clone https://github.com/your-repo/aigor.git
+   git clone https://github.com/mimirosh/test
    cd aigor/api_service
    ```
 
