@@ -1,50 +1,74 @@
-from fastapi import FastAPI, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from database.session import get_db
-from database.models import Departments  # Импортируем модель Departments
-from typing import List
-from pydantic import BaseModel
+"""Aigor API Service: FastAPI-приложение с JWT-авторизацией и модулями calls/operators/departments."""
 
-# Импортируем роуты
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+
+# Auth router и зависимость
+from endpoints.auth import router as auth_router, get_current_user
+
+# Бизнес-роутеры
 from endpoints.operators import router as operators_router
 from endpoints.calls import router as calls_router
 from endpoints.departments import router as departments_router
 
-app = FastAPI(title="Aigor API Service", version="1.0.0", openapi_url="/openapi.json", docs_url="/docs", redoc_url="/redoc", openapi_tags=[
-	{
-		"name": "Operators",
-		"description": "Получение информации о менеджерах"
-	},
-	{
-		"name": "Calls",
-		"description": "Получение данных с информацией по звонкам (транскрипция, аналитика и др.)"
-	},
-  {
-		"name": "Departments",
-		"description": "Получение информации об отделах"
-	}
-])
+APP_TITLE = "Aigor API Service"
+APP_VERSION = "1.0.0"
 
-# Подключаем роуты
-app.include_router(operators_router, tags=["Operators"])
-app.include_router(calls_router, tags=["Calls"])
-app.include_router(departments_router, tags=["Departments"])
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_tags=[
+        {"name": "Auth", "description": "JWT: получение токена и профиль"},
+        {"name": "Operators", "description": "Информация о менеджерах"},
+        {"name": "Calls", "description": "Звонки: транскрипция, аналитика и т.д."},
+        {"name": "Departments", "description": "Информация об отделах"},
+        {"name": "Health", "description": "Проверка состояния сервиса"},
+    ],
+)
 
-class DepartmentResponse(BaseModel):
-    id: int
-    name: str
+# CORS — настрой при необходимости
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # в проде сузить
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/", response_model=List[DepartmentResponse])
-async def get_departments(db: AsyncSession = Depends(get_db)):
-    # Запрос на id и name из таблицы Departments
-    query = select(Departments.id, Departments.name)
-    result = await db.execute(query)
-    departments = result.fetchall()
-    # Преобразуем в список словарей для ответа
-    return [{"id": dep.id, "name": dep.name} for dep in departments]
+# Публичный: авторизация (получение токена и /auth/me)
+app.include_router(auth_router)  # НЕ передаём tags — они уже заданы в самом роутере (единственный тег "Auth")
 
-# Добавляем запуск Uvicorn
+# Защищённые роутеры (весь роутер под токеном)
+app.include_router(
+    operators_router,
+    tags=["Operators"],
+    dependencies=[Depends(get_current_user)],
+)
+app.include_router(
+    calls_router,
+    tags=["Calls"],
+    dependencies=[Depends(get_current_user)],
+)
+app.include_router(
+    departments_router,
+    tags=["Departments"],
+    dependencies=[Depends(get_current_user)],
+)
+
+
+@app.get("/", tags=["Health"], summary="Health-check")
+async def health() -> dict:
+    """Проверка работоспособности сервиса.
+
+    Returns:
+        dict: {"status": "ok", "service": <name>, "version": <semver>}
+    """
+    return {"status": "ok", "service": APP_TITLE, "version": APP_VERSION}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8006, reload=True)

@@ -1,23 +1,59 @@
+"""Departments endpoints: list departments with optional head (uf_head)."""
+
 import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from database.session import get_db
-from database.models import Operators  # Импортируем вашу модель
-from pydantic import BaseModel
 from typing import List, Optional
+
+from database.session import get_db
 from database.models import Departments
+from pydantic import BaseModel
+
+from endpoints.auth import get_current_user  # защита токеном
 
 router = APIRouter(prefix="/departments", tags=["Departments"])
+
+
 class DepartmentResponse(BaseModel):
+    """DTO для отдела в списке."""
     id: int
     name: str
     uf_head: Optional[int]
 
-@router.get("/", response_model=List[DepartmentResponse], summary='Все отделы', description='Получение информации по всем отделам и id руководителей', response_description='Список отделов и руководителей')
-async def get_departments(db: AsyncSession = Depends(get_db)):
-    query = select(Departments.id, Departments.name, Departments.uf_head)
+    class Config:
+        orm_mode = True
+
+
+@router.get(
+    "/",
+    response_model=List[DepartmentResponse],
+    summary="Все отделы",
+    description="Список всех отделов с id и руководителями (uf_head).",
+    response_description="Список отделов и id руководителей",
+)
+async def get_departments(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    """
+    Возвращает упорядоченный список отделов.
+
+    Query:
+        (нет)
+
+    Security:
+        Требуется Bearer JWT (см. `/auth/token`).
+
+    Returns:
+        List[DepartmentResponse]: список отделов.
+
+    Example:
+        curl -H "Authorization: Bearer <TOKEN>" http://localhost:8006/departments/
+    """
+    query = select(Departments.id, Departments.name, Departments.uf_head).order_by(Departments.name)
     result = await db.execute(query)
-    departments = result.fetchall()
-    # Преобразуем в список словарей для ответа
-    return [{"id": dep.id, "name": dep.name, "uf_head": dep.uf_head} for dep in departments]
+    return [
+        DepartmentResponse(id=row.id, name=row.name, uf_head=row.uf_head)
+        for row in result
+    ]
