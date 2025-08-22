@@ -13,12 +13,13 @@ import os
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from pydantic import EmailStr, constr
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.session import get_db
@@ -57,6 +58,8 @@ class TokenData(BaseModel):
     user_id: Optional[int] = None
     email: Optional[str] = None
 
+class TokenWithUser(Token):
+    user: UserOut
 
 class UserOut(BaseModel):
     """Профиль пользователя для /auth/me."""
@@ -73,10 +76,19 @@ class ChangePasswordIn(BaseModel):
     new_password: str
 
 class RegisterIn(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 # === утилиты ===
+def user_from_operator(op: Operators) -> UserOut:
+    return UserOut(
+        id=op.id,
+        name=op.name,
+        last_name=op.last_name,
+        email=op.email,
+        active=getattr(op, "active", None),
+    )
+
 def verify_password(plain: str, hashed: str) -> bool:
     """Проверяет соответствие пароля bcrypt-хэшу."""
     try:
@@ -100,8 +112,8 @@ def create_access_token(data: dict, expires_minutes: int = ACCESS_TOKEN_EXPIRE_M
 
 def validate_password_strength(pw: str) -> None:
     """Простейшая проверка сложности (можешь усилить по желанию)."""
-    if len(pw) < 12:
-        raise HTTPException(status_code=400, detail="Password too short (min 12)")
+    if len(pw) < 8:
+        raise HTTPException(status_code=400, detail="Пароль должен быть минимум 8 символов")
     # при желании: добавить проверки на цифры/символы/регистр
 
 
@@ -174,24 +186,12 @@ async def get_current_operator(
 
 
 # === endpoints ===
-@router.post("/token", response_model=Token, summary="Получить JWT токен")
+@router.post("/token", response_model=TokenWithUser, summary="Получить JWT токен")
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db),
 ):
-    """Возвращает JWT-токен по учетным данным.
-
-    Тело запроса (form-data):
-        - username: str
-        - password: str
-
-    Поведение:
-        - AUTH_MODE=env — сверка с ADMIN_USERNAME/ADMIN_PASSWORD.
-        - AUTH_MODE=operators — поиск оператора по email и проверка пароля.
-
-    Ответ:
-        Token(access_token, token_type='bearer', expires_in)
-    """
+    """Возвращает JWT-токен и профиль пользователя по учетным данным."""
     if AUTH_MODE == "operators":
         claims = await auth_operator(db, form_data.username, form_data.password)
     else:
@@ -200,10 +200,35 @@ async def login_for_access_token(
     if not claims:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
 
+    # сформируем профиль
+    if AUTH_MODE == "operators" and claims.get("user_id"):
+        # пытаемся найти по email сначала (быстрее), затем по id
+        op = None
+        if claims.get("email"):
+            op = await get_operator_by_email(db, claims["email"])
+        if not op:
+            res = await db.execute(select(Operators).where(Operators.id == claims["user_id"]))
+            op = res.scalar_one_or_none()
+        if not op:
+            # крайне маловероятно, но на всякий случай
+            raise HTTPException(status_code=404, detail="User not found")
+        user = UserOut(
+            id=op.id,
+            name=op.name,
+            last_name=op.last_name,
+            email=op.email,
+            active=getattr(op, "active", None),
+        )
+    else:
+        # env-режим: виртуальный пользователь
+        user = UserOut(id=0, name="Admin", last_name=None, email=claims.get("email"), active=True)
+
     token = create_access_token(
         data={"sub": claims["sub"], "user_id": claims.get("user_id"), "email": claims.get("email")}
     )
-    return Token(access_token=token, expires_in=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    return TokenWithUser(access_token=token, expires_in=ACCESS_TOKEN_EXPIRE_MINUTES, user=user)
+
 
 
 @router.get("/me", response_model=UserOut, summary="Профиль текущего пользователя")
@@ -232,40 +257,42 @@ async def me(
     # env mode
     return UserOut(id=0, name="Admin", last_name=None, email=data.email, active=True)
 
-@router.post("/register", response_model=Token, status_code=201, summary="Регистрация (первая установка пароля)")
+from sqlalchemy import select, update, func  # убедись, что func импортирован
+
+@router.post(
+    "/register",
+    response_model=TokenWithUser,          # ⬅️ было Token
+    status_code=201,
+    summary="Регистрация (первая установка пароля)",
+)
 async def register(
-    body: RegisterIn,
+    body: RegisterIn = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Регистрирует пользователя по email, если:
-      - оператор существует,
-      - active = true,
-      - пароль ещё не установлен (password_hash IS NULL).
+    # (по желанию) запретим регистрацию, если активирован env-режим
+    if AUTH_MODE != "operators":
+        raise HTTPException(status_code=403, detail="Registration is available only in operators mode")
 
-    После успешной установки пароля сразу возвращает JWT.
-    """
     email_norm = body.email.strip()
     if not email_norm:
         raise HTTPException(status_code=400, detail="Email is required")
 
     validate_password_strength(body.password)
 
-    # 1) находим оператора по email (CI)
+    # 1) оператор по email (CI)
     op = await get_operator_by_email(db, email_norm)
     if not op:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    # 2) проверяем активность
+    # 2) активность
     if getattr(op, "active", None) is not True:
         raise HTTPException(status_code=400, detail="Operator is not active")
 
-    # 3) не должен иметь уже установленного пароля
+    # 3) пароль ещё не задан
     if getattr(op, "password_hash", None):
         raise HTTPException(status_code=409, detail="Password already set")
 
-    # 4) атомарно устанавливаем пароль (защита от гонки):
-    #    апдейтим только если password_hash ещё NULL и active = true
+    # 4) атомарно установить пароль
     new_hash = hash_password(body.password)
     result = await db.execute(
         update(Operators)
@@ -279,13 +306,17 @@ async def register(
     )
     row = result.first()
     if not row:
-        # кто-то успел поставить пароль параллельно или оператор деактивирован
         raise HTTPException(status_code=409, detail="Password already set or operator inactive")
+
     await db.commit()
 
-    # 5) выдаём токен сразу после регистрации
+    # 5) токен + профиль — как в /auth/token
     token = create_access_token(data={"sub": op.email or str(op.id), "user_id": op.id, "email": op.email})
-    return Token(access_token=token, expires_in=ACCESS_TOKEN_EXPIRE_MINUTES)
+    user = user_from_operator(op)
+
+    return TokenWithUser(access_token=token, expires_in=ACCESS_TOKEN_EXPIRE_MINUTES, user=user)
+
+
 
 @router.post("/change-password", status_code=204, summary="Сменить пароль (self-service)")
 async def change_password(

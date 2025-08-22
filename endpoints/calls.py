@@ -1,6 +1,7 @@
 """Calls endpoints: list calls with filters/pagination; get by id."""
 
-import datetime
+import datetime as dt
+from datetime import datetime, time, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.session import get_db
 from database.models import Calls
 from endpoints.auth import get_current_user
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 router = APIRouter(prefix="/calls", tags=["Calls"])
 
@@ -21,7 +22,7 @@ class CallResponse(BaseModel):
     id: int
     bitrix_call_id: str
     phone_number: str
-    call_start_date: datetime.datetime
+    call_start_date: dt.datetime
     call_duration: int
     record_url: Optional[str]
     file_key: Optional[str]
@@ -33,13 +34,19 @@ class CallResponse(BaseModel):
     analysis_status: Optional[str]
     transcription_retries: Optional[int]
     analysis_retries: Optional[int]
-    created_at: Optional[datetime.datetime]
-    updated_at: Optional[datetime.datetime]
-    deleted_at: Optional[datetime.datetime]
+    created_at: Optional[dt.datetime]
+    updated_at: Optional[dt.datetime]
+    deleted_at: Optional[dt.datetime]
     analysis: Optional[dict]
 
-    class Config:
-        orm_mode = True
+    # новые поля
+    indicators_done: int = 0
+    indicators_total: int = 0
+    penalty_sum: int = 0
+    stages_done: int = 0
+    stages_total: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CallListResponse(BaseModel):
@@ -53,7 +60,7 @@ class CallListResponse(BaseModel):
     "/",
     response_model=CallListResponse,
     summary="Все звонки",
-    description="Список звонков с пагинацией и фильтрами; total считается в одном запросе.",
+    description="Список звонков с пагинацией и фильтрами; total считается в одном запросе. Формат даты `YYYY-MM-DD`",
 )
 async def get_calls(
     skip: int = 0,
@@ -61,8 +68,8 @@ async def get_calls(
     operator_id: Optional[int] = None,
     transcription_status: Optional[str] = None,
     analysis_status: Optional[str] = None,
-    date_from: Optional[datetime.date] = None,
-    date_to: Optional[datetime.date] = None,
+    date_from: Optional[dt.date] = None,
+    date_to: Optional[dt.date] = None,
     phone_like: Optional[str] = None,
     include_data: bool = False,
     deleted: bool = False,
@@ -87,16 +94,6 @@ async def get_calls(
     Поведение:
         - Результаты отсортированы по `call_start_date DESC`.
         - `total` вычисляется через `count() over()` в том же запросе.
-
-    Security:
-        Требуется Bearer JWT.
-
-    Returns:
-        CallListResponse: элементы и общее количество.
-
-    Example:
-        curl -H "Authorization: Bearer <TOKEN>" \\
-             "http://localhost:8006/calls/?date_from=2025-08-01&operator_id=10&limit=50"
     """
     filters = []
     if operator_id is not None:
@@ -106,9 +103,9 @@ async def get_calls(
     if analysis_status is not None:
         filters.append(Calls.analysis_status == analysis_status)
     if date_from:
-        filters.append(Calls.call_start_date >= date_from)
+        filters.append(Calls.call_start_date >= dt.datetime.combine(date_from, time.min))
     if date_to:
-        filters.append(Calls.call_start_date <= date_to)
+        filters.append(Calls.call_start_date <  dt.datetime.combine(date_to + timedelta(days=1), time.min))
     if phone_like:
         filters.append(Calls.phone_number.ilike(f"%{phone_like}%"))
     if not deleted:
@@ -125,16 +122,24 @@ async def get_calls(
     rows = res.all()
     if not rows:
         return {"items": [], "total": 0}
-
+    
     total = rows[0].total
     cols = list(Calls.__table__.columns.keys())
 
     items_dicts = []
     for r in rows:
         d = {c: getattr(r, c) for c in cols}
+
+        # если просили «лёгкий» список — глушим тяжёлые JSONB
         if not include_data:
             d["transcription"] = None
             d["analysis"] = None
+
+        # защитимся от возможных NULL в новых числовых полях
+        for k in ("indicators_done", "indicators_total", "penalty_sum", "stages_done", "stages_total"):
+            if d.get(k) is None:
+                d[k] = 0
+
         items_dicts.append(d)
 
     items = [CallResponse(**d) for d in items_dicts]
@@ -154,25 +159,15 @@ async def get_call(
 ):
     """
     Возвращает объект звонка по `call_id`.
-
-    Path:
-        call_id (int): идентификатор звонка.
-
-    Security:
-        Требуется Bearer JWT.
-
-    Returns:
-        CallResponse: объект звонка.
-
-    Errors:
-        404 — звонок не найден.
-
-    Example:
-        curl -H "Authorization: Bearer <TOKEN>" \\
-             http://localhost:8006/calls/100500
     """
     res = await db.execute(select(Calls).where(Calls.id == call_id))
     call = res.scalar_one_or_none()
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
+
+    # если в БД вдруг есть NULL, отдаём 0 — чтобы не падать на сериализации
+    for k in ("indicators_done", "indicators_total", "penalty_sum", "stages_done", "stages_total"):
+        if getattr(call, k, None) is None:
+            setattr(call, k, 0)
+
     return CallResponse.model_validate(call, from_attributes=True)

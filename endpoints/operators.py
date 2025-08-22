@@ -86,12 +86,16 @@ async def get_operators(
     if department_id is not None:
         filters.append(Operators.departments.any(Departments.id == department_id))
     if q:
-        ilike = f"%{q}%"
-        filters.append(
-            (Operators.name.ilike(ilike))
-            | (Operators.last_name.ilike(ilike))
-            | (Operators.email.ilike(ilike))
-        )
+        # Разделяем q на токены по пробелам для поиска с AND между токенами
+        tokens = q.strip().split()
+        for token in tokens:
+            ilike = f"%{token}%"
+            subfilter = (
+                (Operators.name.ilike(ilike))
+                | (Operators.last_name.ilike(ilike))
+                | (Operators.email.ilike(ilike))
+            )
+            filters.append(subfilter)
 
     id_rows = await db.execute(
         select(func.count().over().label("total"), Operators.id)

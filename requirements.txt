@@ -1,14 +1,29 @@
+# ── Web/API ─────────────────────────────────────────────────────────────
 fastapi==0.115.2
-uvicorn==0.32.0
+uvicorn[standard]==0.32.0        # uvloop, httptools, watchfiles и пр.
+
+# ── Валидации и модели ─────────────────────────────────────────────────
+pydantic==2.9.2
+email-validator>=2.2,<3          # требуется для pydantic.EmailStr
+python-multipart==0.0.9          # для OAuth2PasswordRequestForm / form-data
+
+# ── JWT / крипто ───────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+
+# ── Пароли ─────────────────────────────────────────────────────────────
+passlib[bcrypt]==1.7.4
+bcrypt>=4.1                       # совместимо с passlib 1.7.4 и Py3.12+
+
+# ── БД и миграции ──────────────────────────────────────────────────────
 sqlalchemy[asyncio]==2.0.35
 asyncpg==0.30.0
-pydantic==2.9.2
-python-dotenv==1.0.1
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
 alembic==1.13.3
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-python-multipart>=0.0.9    # нужно для OAuth2PasswordRequestForm
-fastapi[all]  # Убедитесь, что FastAPI установлен с extras
-alembic
+
+# ── Утилиты ────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── Gemini ────────────────────────────────────────────────────────────
+google-generativeai
+httpx
+sqladmin
+sqladmin-async
